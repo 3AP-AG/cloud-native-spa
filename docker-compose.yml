@@ -1,0 +1,12 @@
+version: '3'
+
+services:
+  cloud-native-spa:
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    ports:
+      - 3000:3000
+    environment:
+      REACT_APP_API_KEY: super_secret_api_key_which_is_exposed_to_client😅
+      REACT_APP_API_URL: https://uros.milenkovic.xyz

@@ -1,46 +1,113 @@
-# Getting Started with Create React App
+# Cloud Native SPA
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+## The problem
 
-## Available Scripts
+Currently, our go-to approach to deploy SPA into a cloud-native environment is to use the nginx 
+regex filter magic with envsubst. This allows us to have one deployable artifact but be able 
+to change configurations per environment.
 
-In the project directory, you can run:
+While this approach works very well I still feel thats it's a hacky solution.
 
-### `yarn start`
+Are there alternative solutions available?
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+https://stackoverflow.com/c/3ap/questions/24
 
-The page will reload if you make edits.\
-You will also see any lint errors in the console.
+## Solutioin
 
-### `yarn test`
+Using React as our strategic technology for SPA, and create-react-app as option for scaffolding 
+React SPA, we are all using their approach for [environment variables](https://create-react-app.dev/docs/adding-custom-environment-variables). 
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+The main problem here is that they only work at compile time. 
 
-### `yarn build`
+Another problem is that optimizer can do some pre-calculations with current environment variables 
+which can lead to some strange bugs. For example, if you type something like this in your code
+```ts
+const foo = process.env.REACT_APP_FOO === "true";
+```
+in compile time you don't have your environment variables set yet. Then, optimizer will change
+`prcess.env.REACT_APP_FOO` with empty string. Then it will try to go further, it sees that `"" === "true"`
+is `false`. So, at the end, all you get in your compiled js file is `const foo = false;`, which means
+that we loose placeholder for env substitution. This kind of "bugs" are really hard to follow and debug. 
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+In addition to the above, our current approach is bad for browser cacheing. If browser caches js file, 
+which was filtered on nginx level, there is no way you can apply new environment variables 
+without creating new artifact with different filename.
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+In order to solve this, we need something which will apply env vars at runtime and not in build time. 
+Approach in this repo would be to generate file called env.js when container starts and 
+contains all env vars. That generated file should be stored in public directory and assign 
+all env vars to window object. Content for the generated `env.js` file will be something like this:
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+```js
+window.env = {
+  // Here we should list all available env vars which app uses 
+  // with values from env for that container
+  REACT_APP_API_KEY: "api-key",
+  REACT_APP_API_URL: "http://localhost:8080",
+}
+```
 
-### `yarn eject`
+Script for creating this `env.js` file is [here](scripts/generate-env-file.sh). 
+We also want to explicitly tell the script which env vars should be there. In order to do that, 
+we use file [.env.template](.env.template). 
+Note that values in `.env.template` are set to some random value (`xxx`), 
+because we don't care about them, we care only for keys. 
 
-**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+So, to summarize, script is running through `.env.template`, for each row checks if key starts with 
+`REACT_APP_`, and, if condition is satisfied, adds new row in generated file with properly set env var.
 
-If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+In order to apply new env vars, this script should run whenever container starts. 
+We can do that defining new script for entrypoint in [Dockerfile](Dockerfile) like this 
+```
+ENTRYPOINT [ "sh", "/nginx-entrypoint.sh" ]
+```
+This `nginx-entrypoint.sh` will start our script for generating `env.js` file, and after that it 
+will start nginx server.
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+In [nginx.conf](nginx.conf) we see that every request is cached (in the browser) except for `env.js`. 
 
-You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+The only thing left is consumption of our generated `env.js` file. First thing is that we 
+include that file in [index.html](public/index.html) like this: 
 
-## Learn More
+```html
+<% if (process.env.NODE_ENV === 'production') { %>
+    <script src="%PUBLIC_URL%/env.js"></script>
+<% } %>
+```
+We want to include `env.js` file only in production. For development purposes we can read values 
+from `process.env`. We don't want to generate new file every time we start dev server.
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+Next, we can create file which exports env object like [this](src/env.ts):
+```ts
+type EnvKey =
+  | "REACT_APP_API_KEY"
+  | "REACT_APP_API_URL";
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+export const env =
+  process.env.NODE_ENV === "development"
+    ? Object.keys(process.env).reduce((acc, curr) => {
+        if (curr.startsWith("REACT_APP_")) {
+          acc[curr as EnvKey] = process.env[curr] as string;
+        }
+        return acc;
+      }, {} as Record<EnvKey, string>)
+    : ((window as any).env as Record<EnvKey, string>);
+```
+and use it like this in our application
+```tsx
+import { env } from "./env";
+
+console.log(env.REACT_APP_API_KEY);
+```
+
+## Conclusion
+Proposed solution here solves two main problems which exists in regex filter magic with envsubst.
+
+1. Browser caching: Here we can use headers to enable browser cache for every js or css file 
+   without thinking about the magic with envsubst. nginx doesn't change any of our file
+2. Strange bugs with optimizers' pre-calculation. 
+
+You can play around with `docker-compose` on this repo to see what's happening. 
+Stop container, change environment, run container
+
+Cheers! 🍻
